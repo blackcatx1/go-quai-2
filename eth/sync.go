@@ -19,7 +19,6 @@ package eth
 import (
 	"math/big"
 	"math/rand"
-	"time"
 
 	"github.com/dominant-strategies/go-quai/common"
 	"github.com/dominant-strategies/go-quai/core/types"
@@ -30,8 +29,7 @@ import (
 )
 
 const (
-	forceSyncCycle      = 60 * time.Second // Time interval to force syncs, even if few peers are available
-	defaultMinSyncPeers = 3                // Amount of peers desired to start syncing
+	defaultMinSyncPeers = 3 // Amount of peers desired to start syncing
 
 	// This is the target size for the packs of transactions sent by txsyncLoop64.
 	// A pack can get larger than this if a single transactions exceeds this size.
@@ -61,7 +59,7 @@ func (h *handler) syncTransactions(p *eth.Peer) {
 	// The eth/65 protocol introduces proper transaction announcements, so instead
 	// of dripping transactions across multiple peers, just send the entire list as
 	// an announcement and let the remote side decide what they need (likely nothing).
-	if p.Version() >= eth.ETH65 {
+	if p.Version() >= eth.QUAI1 {
 		hashes := make([]common.Hash, len(txs))
 		for i, tx := range txs {
 			hashes[i] = tx.Hash()
@@ -92,7 +90,7 @@ func (h *handler) txsyncLoop64() {
 
 	// send starts a sending a pack of transactions from the sync.
 	send := func(s *txsync) {
-		if s.p.Version() >= eth.ETH65 {
+		if s.p.Version() >= eth.QUAI1 {
 			panic("initial transaction syncer running on eth/65+")
 		}
 		// Fill pack with transactions up to the target size.
@@ -154,8 +152,6 @@ func (h *handler) txsyncLoop64() {
 // chainSyncer coordinates blockchain sync components.
 type chainSyncer struct {
 	handler     *handler
-	force       *time.Timer
-	forced      bool // true when force timer fired
 	peerEventCh chan struct{}
 	doneCh      chan error // non-nil when sync is running
 }
@@ -201,11 +197,6 @@ func (cs *chainSyncer) loop() {
 	defer cs.handler.blockFetcher.Stop()
 	defer cs.handler.downloader.Terminate()
 
-	// The force timer lowers the peer count threshold down to one when it fires.
-	// This ensures we'll always start sync even if there aren't enough peers.
-	cs.force = time.NewTimer(forceSyncCycle)
-	defer cs.force.Stop()
-
 	for {
 		if op := cs.nextSyncOp(); op != nil {
 			cs.startSync(op)
@@ -215,10 +206,6 @@ func (cs *chainSyncer) loop() {
 			// Peer information changed, recheck.
 		case <-cs.doneCh:
 			cs.doneCh = nil
-			cs.force.Reset(forceSyncCycle)
-			cs.forced = false
-		case <-cs.force.C:
-			cs.forced = true
 
 		case <-cs.handler.quitSync:
 			// Disable all insertion on the blockchain. This needs to happen before
@@ -241,9 +228,8 @@ func (cs *chainSyncer) nextSyncOp() *chainSyncOp {
 
 	// Ensure we're at minimum peer count.
 	minPeers := defaultMinSyncPeers
-	if cs.forced {
-		minPeers = 1
-	} else if minPeers > cs.handler.maxPeers {
+
+	if minPeers > cs.handler.maxPeers {
 		minPeers = cs.handler.maxPeers
 	}
 	if cs.handler.peers.len() < minPeers {
@@ -274,33 +260,37 @@ func (cs *chainSyncer) modeAndLocalHead() (downloader.SyncMode, *big.Int) {
 
 // startSync launches doSync in a new goroutine.
 func (cs *chainSyncer) startSync(op *chainSyncOp) {
-	cs.doneCh = make(chan error, 10)
+	cs.doneCh = make(chan error, 1)
 	go func() { cs.doneCh <- cs.handler.doSync(op) }()
 }
 
 // doSync synchronizes the local blockchain with a remote peer.
 func (h *handler) doSync(op *chainSyncOp) error {
-	// Run the sync cycle, and disable fast sync if we're past the pivot block
-	err := h.downloader.Synchronise(op.peer.ID(), op.head, op.entropy, op.mode)
-	log.Info("Downloader exited", "err", err)
-	if err != nil {
-		return err
-	}
-	// If we've successfully finished a sync cycle and passed any required checkpoint,
-	// enable accepting transactions from the network.
-	head := h.core.CurrentBlock()
-	if head == nil {
-		log.Warn("doSync: head is nil", "hash", h.core.CurrentHeader().Hash(), "number", h.core.CurrentHeader().NumberArray())
-		return nil
-	}
-	if head.NumberU64() > 0 {
-		// We've completed a sync cycle, notify all peers of new state. This path is
-		// essential in star-topology networks where a gateway node needs to notify
-		// all its out-of-date peers of the availability of a new block. This failure
-		// scenario will most often crop up in private and hackathon networks with
-		// degenerate connectivity, but it should be healthy for the mainnet too to
-		// more reliably update peers or the local TD state.
-		h.BroadcastBlock(head, false)
+	// Stopping the downloader here temporarily for Region and Zones
+	nodeCtx := common.NodeLocation.Context()
+	if nodeCtx == common.PRIME_CTX {
+		// Run the sync cycle, and disable fast sync if we're past the pivot block
+		err := h.downloader.Synchronise(op.peer.ID(), op.head, op.entropy, op.mode)
+		log.Info("Downloader exited", "err", err)
+		if err != nil {
+			return err
+		}
+		// If we've successfully finished a sync cycle and passed any required checkpoint,
+		// enable accepting transactions from the network.
+		head := h.core.CurrentBlock()
+		if head == nil {
+			log.Warn("doSync: head is nil", "hash", h.core.CurrentHeader().Hash(), "number", h.core.CurrentHeader().NumberArray())
+			return nil
+		}
+		if head.NumberU64() > 0 {
+			// We've completed a sync cycle, notify all peers of new state. This path is
+			// essential in star-topology networks where a gateway node needs to notify
+			// all its out-of-date peers of the availability of a new block. This failure
+			// scenario will most often crop up in private and hackathon networks with
+			// degenerate connectivity, but it should be healthy for the mainnet too to
+			// more reliably update peers or the local TD state.
+			h.BroadcastBlock(head, false)
+		}
 	}
 	return nil
 }
